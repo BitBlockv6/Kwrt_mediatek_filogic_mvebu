@@ -1,3 +1,8 @@
+#=================================================
+# Based on: https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build selected KWRT/OpenWrt targets using GitHub Actions
+#=================================================
+
 name: Build selected KWRT firmwares
 
 on:
@@ -16,6 +21,7 @@ concurrency:
 env:
   REPO_TOKEN: ${{ github.token }}
   TZ: Europe/Berlin
+  REPO_BRANCH: openwrt-25.12
 
 jobs:
   build:
@@ -45,13 +51,13 @@ jobs:
         shell: bash
         run: |
           set -e
+          echo "${{ matrix.target }}"
           source "${{ github.workspace }}/devices/common/settings.ini"
           if [ -f "${{ github.workspace }}/devices/${{ matrix.target }}/settings.ini" ]; then
             source "${{ github.workspace }}/devices/${{ matrix.target }}/settings.ini"
           fi
 
           echo "REPO_URL=${REPO_URL}" >> "$GITHUB_ENV"
-          echo "REPO_BRANCH=${REPO_BRANCH}" >> "$GITHUB_ENV"
           echo "CONFIG_FILE=${CONFIG_FILE}" >> "$GITHUB_ENV"
           echo "DIY_SH=${DIY_SH}" >> "$GITHUB_ENV"
           echo "FREE_UP_DISK=${FREE_UP_DISK}" >> "$GITHUB_ENV"
@@ -76,7 +82,7 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Init environment
+      - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
         shell: bash
@@ -84,18 +90,18 @@ jobs:
           set -e
           sudo -E apt-get -qq update
           sudo -E apt-get -qq install \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses5-dev libssl-dev python3-setuptools rsync swig unzip \
-            zlib1g-dev file wget dwarves llvm python3-pyelftools libpython3-dev aria2 \
-            jq qemu-utils ccache rename libelf-dev device-tree-compiler libgmp3-dev \
-            libmpc-dev libfuse-dev
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget dwarves \
+            llvm python3-pyelftools libpython3-dev aria2 jq qemu-utils ccache rename \
+            libelf-dev device-tree-compiler libgmp3-dev libmpc-dev libfuse-dev
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
           sudo timedatectl set-timezone "${TZ}"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-      - name: Prepare build metadata
+      - name: Get current date
         shell: bash
         run: |
           echo "date=$(date +'%Y%m%d-%H%M')" >> "$GITHUB_ENV"
@@ -122,11 +128,7 @@ jobs:
             AUTO_BRANCH="openwrt-25.12"
           fi
 
-          if [[ -z "${REPO_BRANCH}" && "${REPO_URL}" == "https://github.com/openwrt/openwrt" ]]; then
-            git clone "${REPO_URL}" -b "${AUTO_BRANCH}" openwrt
-          elif [[ -z "${REPO_BRANCH}" ]]; then
-            git clone "${REPO_URL}" openwrt
-          else
+          if [[ -n "${REPO_BRANCH}" ]]; then
             if [[ ${#REPO_BRANCH} -lt 10 ]]; then
               git clone "${REPO_URL}" -b "${REPO_BRANCH}" openwrt
             else
@@ -135,9 +137,15 @@ jobs:
               git checkout "${REPO_BRANCH}"
               cd ..
             fi
+          elif [[ "${REPO_URL}" == "https://github.com/openwrt/openwrt" ]]; then
+            git clone "${REPO_URL}" -b "${AUTO_BRANCH}" openwrt
+          else
+            git clone "${REPO_URL}" openwrt
           fi
 
-      - name: Relink build directories
+      - name: Free up disk space
+        env:
+          DEBIAN_FRONTEND: noninteractive
         shell: bash
         run: |
           sudo mkdir -p -m 777 /mnt/openwrt/build_dir openwrt/staging_dir
@@ -163,6 +171,11 @@ jobs:
               git clone --filter=blob:none --sparse "$rurl" "$tmpdir"
               cd "$tmpdir"
               git checkout "$branch"
+            fi
+
+            if [ "$?" != 0 ]; then
+              echo "error on $rurl"
+              exit 1
             fi
 
             git sparse-checkout init --cone
@@ -206,10 +219,31 @@ jobs:
         run: |
           set -eux
           cd openwrt
+
           cp -rn devices/common/patches "devices/${{ matrix.target }}/" || true
 
-          if [ -n "$(ls -A devices/${{ matrix.target }}/patches/*.bin.patch 2>/dev/null)" ]; then
-            git apply "devices/${{ matrix.target }}/patches/"*.bin.patch
+          if [[ "${{ matrix.target }}" == "mediatek_filogic" ]]; then
+            mkdir -p "devices/${{ matrix.target }}/patches.disabled"
+
+            find "devices/${{ matrix.target }}/patches" -maxdepth 1 -type f ( \
+              -iname '*360t7*' -o \
+              -iname '*jcg*' -o \
+              -iname '*asr3000*' -o \
+              -iname '*imou*' -o \
+              -iname '*ct3003*' -o \
+              -iname '*ea0326*' -o \
+              -iname '*netcore*' -o \
+              -iname '*cf-wr632ax*' -o \
+              -iname '*ax3000t*' -o \
+              -iname '*ruijie*' -o \
+              -iname '*ax6000*' -o \
+              -iname '*ax6s*' -o \
+              -iname '*magic-nx30-pro*' \
+            ) -exec mv -v {} "devices/${{ matrix.target }}/patches.disabled/" ; || true
+          fi
+
+          if compgen -G "devices/${{ matrix.target }}/patches/*.bin.patch" > /dev/null; then
+            git apply devices/${{ matrix.target }}/patches/*.bin.patch
           fi
 
           find "devices/${{ matrix.target }}/patches" -maxdepth 1 -type f -name '*.revert.patch' -print0 2>/dev/null \
@@ -241,20 +275,25 @@ jobs:
           clean: false
           prefix: ${{ github.workspace }}/openwrt
 
-      - name: Compile firmware
+      - name: Compile the firmware
         shell: bash
         run: |
           set -euxo pipefail
+          df -hT
           cd openwrt
+          echo -e "$(($(nproc)+1)) thread compile"
+
           make -j"$(($(nproc)+1))" || {
             log=$(mktemp)
             make V=s &> "$log" || true
             tail -200 "$log"
+            df -hT
             exit 1
           }
 
           rm -rf staging_dir/toolchain-*/bin/*openwrt-linux-musl-lto-dump || true
           rm -rf staging_dir/toolchain-*/initial || true
+          df -hT
 
       - name: Filter requested firmware files
         shell: bash
