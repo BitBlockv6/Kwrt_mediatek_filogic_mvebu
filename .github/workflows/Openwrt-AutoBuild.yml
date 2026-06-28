@@ -220,7 +220,8 @@ jobs:
           set -eux
           cd openwrt
 
-          cp -rn devices/common/patches "devices/${{ matrix.target }}/" || true
+          mkdir -p "devices/${{ matrix.target }}/patches"
+          cp -rnf devices/common/patches/. "devices/${{ matrix.target }}/patches/" || true
 
           if [[ "${{ matrix.target }}" == "mediatek_filogic" ]]; then
             mkdir -p "devices/${{ matrix.target }}/patches.disabled"
